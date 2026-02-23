@@ -23,12 +23,14 @@ SCORING STRATEGY BY FIELD TYPE
 
   Flat string lists  (conservative_method, lifestyle_habit_modifications)
   ─────────────────
-    • Each item embedded individually
-    • Soft matching Coverage F1:
-        Precision = avg( max cosine(p, g) for g in gold_list  for p in pred_list )
-        Recall    = avg( max cosine(g, p) for p in pred_list  for g in gold_list )
-        F1        = harmonic mean(P, R)
-    • Threshold 0.65 applies: cosine < 0.65 treated as 0.0
+    • Each list is concatenated into a single string joined by " | "
+    • Both pred and gold lists are embedded as single vectors
+    • Score = raw cosine similarity — no threshold gate applied
+    • Only true negatives (numerical noise) are clamped to 0.0
+    • Edge cases:
+        both empty  → 1.0
+        pred empty  → 0.0
+        gold empty  → 0.0
 
   Single string fields  (patient_education, when_to_seek_medical_care,
                          follow_up sub-fields, referral aim)
@@ -42,8 +44,16 @@ EMBEDDING DETAILS
   Model  : google/medgemma-4b-it  (or any local path)
   Layer  : last hidden state, mean-pooled over non-padding tokens
   Norm   : L2-normalized → cosine similarity = dot product
-  Null   : (None, None) → 1.0 | (None, X) or (X, None) → 0.0
-  Thresh : cosine < 0.65 → 0.0  (unrelated medical text baseline gate)
+
+  Two similarity modes:
+    similarity()      — WITH threshold gate (default 0.65)
+                        Used ONLY for item name matching in structured lists.
+                        Prevents unrelated items from being paired.
+    similarity_raw()  — NO threshold gate
+                        Used for all sub-field scoring and long free-text fields.
+                        Partial overlap produces a proportional score, not 0.0.
+  Null contract (both modes):
+    (None, None) → 1.0 | (None, X) or (X, None) → 0.0
 
 ─────────────────────────────────────────────────────────────────────────────
 CONFUSION DETECTION  (optional, enabled with --confusion)
@@ -81,7 +91,26 @@ from tqdm import tqdm
 
 class EmbeddingEngine:
     """
-    Loads MedGemma-4b-it once, batch-embeds all strings, caches results.
+    Loads a text embedding model once, batch-embeds all strings, caches results.
+
+    Supports two architectures, automatically detected at load time:
+
+    Encoder models  (BERT, RoBERTa, BioBERT, MedEmbed, etc.)
+    ─────────────────────────────────────────────────────────
+      Pooling: mean-pool over all non-padding token hidden states.
+      Bidirectional attention — every token sees full context, so
+      mean pooling produces a reliable sentence representation.
+
+    Decoder / causal LM  (MedGemma, Gemma, LLaMA, Mistral, etc.)
+    ──────────────────────────────────────────────────────────────
+      Pooling: last non-padding token hidden state only.
+      Causal LMs are unidirectional — only the final token has attended
+      to the full input, so it carries the best summary vector.
+      Mean-pooling causal LM states produces near-random cosines.
+
+    Detection via model.config.model_type — any type containing
+    "gemma", "llama", "mistral", "falcon", "gpt", "opt", "bloom",
+    or "mpt" is treated as a causal LM. All others use mean pooling.
 
     Usage pattern:
         engine = EmbeddingEngine(model_name, device, batch_size)
@@ -113,6 +142,15 @@ class EmbeddingEngine:
             torch_dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
         ).to(self.device)
         self.model.eval()
+
+        # Detect architecture: causal LM → last-token pooling
+        # encoder → mean pooling
+        _causal_types = {"gemma", "llama", "mistral", "falcon",
+                         "gpt", "opt", "bloom", "mpt"}
+        model_type = getattr(self.model.config, "model_type", "").lower()
+        self.is_causal_lm = any(t in model_type for t in _causal_types)
+        pooling_strategy = "last-token" if self.is_causal_lm else "mean-pool"
+        print(f"[EmbeddingEngine] Architecture: {model_type} → {pooling_strategy} pooling")
         print("[EmbeddingEngine] Model ready.")
 
     # ── core embedding ────────────────────────────────────────────────────────
@@ -142,18 +180,30 @@ class EmbeddingEngine:
             output = self.model(**encoded)
 
         # last_hidden_state: [B, seq_len, H]
-        hidden = output.last_hidden_state
-        attention_mask = encoded["attention_mask"]  # [B, seq_len]
+        hidden = output.last_hidden_state          # [B, seq_len, H]
+        attention_mask = encoded["attention_mask"] # [B, seq_len]
 
-        # Mean pool: sum(hidden * mask) / sum(mask)
-        mask_expanded = attention_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
-        sum_hidden = (hidden * mask_expanded).sum(dim=1)       # [B, H]
-        sum_mask   = mask_expanded.sum(dim=1).clamp(min=1e-9)  # [B, 1]
-        pooled     = sum_hidden / sum_mask                      # [B, H]
+        if self.is_causal_lm:
+            # Last non-padding token pooling for causal/decoder LMs.
+            # Only the final token has attended to the full input sequence,
+            # so its hidden state is the best summary vector.
+            # Find the index of the last non-padding token per sample.
+            # attention_mask: 1 for real tokens, 0 for padding
+            # sum(mask, dim=1) - 1  gives the 0-based index of last real token
+            seq_lengths = attention_mask.sum(dim=1) - 1          # [B]
+            batch_idx   = torch.arange(hidden.size(0),
+                                       device=hidden.device)      # [B]
+            pooled = hidden[batch_idx, seq_lengths]               # [B, H]
+        else:
+            # Mean pooling for encoder (bidirectional) models
+            mask_expanded = attention_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
+            sum_hidden    = (hidden * mask_expanded).sum(dim=1)   # [B, H]
+            sum_mask      = mask_expanded.sum(dim=1).clamp(min=1e-9)  # [B, 1]
+            pooled        = sum_hidden / sum_mask                  # [B, H]
 
-        # L2 normalize
+        # L2 normalize → cosine similarity = dot product
         norms  = pooled.norm(dim=-1, keepdim=True).clamp(min=1e-9)
-        normed = (pooled / norms).cpu().float().numpy()         # [B, H]
+        normed = (pooled / norms).cpu().float().numpy()            # [B, H]
 
         return normed
 
@@ -205,20 +255,12 @@ class EmbeddingEngine:
             return None
         return self._cache.get(text.strip().lower())
 
-    def similarity(self, pred: str | None, gold: str | None,
-                   threshold: float = 0.65) -> float:
+    def _cosine(self, pred: str | None, gold: str | None):
         """
-        Cosine similarity between two strings via cached embeddings.
-
-        Null contract (preserved from original chrF version):
-            (None, None) → 1.0   both agree nothing is here
-            (None, X)    → 0.0   one side missing
-            (X, None)    → 0.0
-
-        Threshold gate:
-            cosine < threshold → 0.0  (treat as unrelated)
+        Shared null contract and embedding lookup.
+        Returns 1.0, 0.0, or a raw float cosine for the caller to handle.
+        Returns None signals caller should return 0.0 (missing embeddings).
         """
-        # Null contract
         if not pred and not gold:
             return 1.0
         if not pred or not gold:
@@ -227,89 +269,136 @@ class EmbeddingEngine:
         pred_clean = str(pred).strip().lower()
         gold_clean = str(gold).strip().lower()
 
-        # Exact match shortcut (also handles identical strings not yet embedded)
         if pred_clean == gold_clean:
             return 1.0
 
         pred_vec = self.get_embedding(pred_clean)
         gold_vec = self.get_embedding(gold_clean)
 
-        # Fallback if embedding missing (shouldn't happen after build_cache)
         if pred_vec is None or gold_vec is None:
+            return None
+
+        return float(np.dot(pred_vec, gold_vec))
+
+    def similarity(self, pred: str | None, gold: str | None,
+                   threshold: float = 0.65) -> float:
+        """
+        Cosine similarity WITH threshold gate.
+
+        Use ONLY for item name matching in match_and_score_list() where the
+        threshold acts as a correctness gate — preventing genuinely unrelated
+        items (e.g. 'metformin' vs 'chest X-ray') from being paired.
+
+        Null contract:
+            (None, None) → 1.0
+            (None, X)    → 0.0
+            (X, None)    → 0.0
+
+        Threshold gate:
+            cosine < threshold → 0.0
+        """
+        cosine = self._cosine(pred, gold)
+        if cosine is None:
             return 0.0
-
-        cosine = float(np.dot(pred_vec, gold_vec))  # already L2-normalized
-
         return round(cosine if cosine >= threshold else 0.0, 4)
 
+    def similarity_raw(self, pred: str | None, gold: str | None) -> float:
+        """
+        Raw cosine similarity — NO threshold gate.
+
+        Use for sub-field scoring and long free-text fields:
+        aim_of_referral, aim_of_follow_up, patient_education,
+        when_to_seek_medical_care, dosage, route, and any other field
+        where partial overlap should produce a proportional score.
+
+        Null contract:
+            (None, None) → 1.0
+            (None, X)    → 0.0
+            (X, None)    → 0.0
+
+        Only true negatives (numerical noise) are clamped to 0.0.
+        """
+        cosine = self._cosine(pred, gold)
+        if cosine is None:
+            return 0.0
+        return round(max(0.0, cosine), 4)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — Embedding Coverage F1  (replaces token LCS Coverage F1)
+# SECTION 2 — Set-level cosine similarity for flat string lists
 # ══════════════════════════════════════════════════════════════════════════════
 
-def embedding_coverage_f1(pred_list: list,
-                           gold_list: list,
-                           engine: EmbeddingEngine,
-                           threshold: float = 0.65) -> dict:
+def set_level_cosine(pred_list: list,
+                     gold_list: list,
+                     engine: EmbeddingEngine) -> dict:
     """
-    Soft-matching Coverage Precision, Recall, and F1 for two flat string lists.
+    Set-level cosine similarity for flat string lists.
 
-    For each pred item  → best cosine match across all gold items  = precision score
-    For each gold item  → best cosine match across all pred items  = recall score
+    Both lists are concatenated into single strings joined by " | ",
+    then embedded as single vectors and compared with cosine similarity.
 
-    This preserves the spirit of the original Coverage F1 (handles splits/merges)
-    but uses semantic similarity rather than LCS token overlap.
+    No threshold is applied — the raw cosine value is returned directly.
+    This is intentional: set-level strings are long concatenations where
+    partial semantic overlap should produce a proportional score, not 0.0.
+    Only true negatives (numerical noise below 0.0) are clamped.
 
-    Edge cases mirror original:
-        both empty      → P=1, R=1, F1=1
-        pred empty only → P=1, R=0, F1=0
-        gold empty only → P=0, R=1, F1=0
+    This approach:
+      - Is order-invariant in practice (mean pooling dilutes positional signal)
+      - Handles split/merge items naturally (semantic content dominates)
+      - Avoids item-level redundancy artifacts from soft max-matching
+      - Captures the holistic semantic space of the full list
+
+    Edge cases:
+        both empty  → 1.0  (both agree nothing is here)
+        pred empty  → 0.0  (model missed entire field)
+        gold empty  → 0.0  (model hallucinated entire field)
+
+    Args:
+        pred_list : list of predicted strings
+        gold_list : list of gold strings
+        engine    : EmbeddingEngine instance with cache built
+
+    Returns:
+        dict with keys:
+            score         : float, raw cosine similarity (no threshold gate)
+            pred_text     : str, the concatenated pred string that was embedded
+            gold_text     : str, the concatenated gold string that was embedded
     """
-    pred_list = [str(x).strip().lower() for x in (pred_list or [])]
-    gold_list = [str(x).strip().lower() for x in (gold_list or [])]
+    pred_list = [str(x).strip().lower() for x in (pred_list or []) if str(x).strip()]
+    gold_list = [str(x).strip().lower() for x in (gold_list or []) if str(x).strip()]
 
-    if not gold_list and not pred_list:
-        return {"precision": 1.0, "recall": 1.0, "f1": 1.0,
-                "precision_per_item": [], "recall_per_item": []}
-    if not gold_list:
-        return {"precision": 0.0, "recall": 1.0, "f1": 0.0,
-                "precision_per_item": [(p, 0.0) for p in pred_list],
-                "recall_per_item": []}
+    # Edge cases
+    if not pred_list and not gold_list:
+        return {"score": 1.0, "pred_text": "", "gold_text": ""}
     if not pred_list:
-        return {"precision": 1.0, "recall": 0.0, "f1": 0.0,
-                "precision_per_item": [],
-                "recall_per_item": [(g, 0.0) for g in gold_list]}
+        gold_text = " | ".join(gold_list)
+        return {"score": 0.0, "pred_text": "", "gold_text": gold_text}
+    if not gold_list:
+        pred_text = " | ".join(pred_list)
+        return {"score": 0.0, "pred_text": pred_text, "gold_text": ""}
 
-    # Build similarity matrix [len(pred), len(gold)]
-    sim_matrix = np.array([
-        [engine.similarity(p, g, threshold=threshold)
-         for g in gold_list]
-        for p in pred_list
-    ])  # shape: [P, G]
+    pred_text = " | ".join(pred_list)
+    gold_text = " | ".join(gold_list)
 
-    # Precision: each pred matched to best gold
-    precision_per_item = [
-        (pred_list[i], float(sim_matrix[i].max()))
-        for i in range(len(pred_list))
-    ]
+    # Exact match shortcut
+    if pred_text == gold_text:
+        return {"score": 1.0, "pred_text": pred_text, "gold_text": gold_text}
 
-    # Recall: each gold matched to best pred
-    recall_per_item = [
-        (gold_list[j], float(sim_matrix[:, j].max()))
-        for j in range(len(gold_list))
-    ]
+    pred_vec = engine.get_embedding(pred_text)
+    gold_vec = engine.get_embedding(gold_text)
 
-    precision = round(sum(s for _, s in precision_per_item) / len(precision_per_item), 4)
-    recall    = round(sum(s for _, s in recall_per_item)    / len(recall_per_item),    4)
-    f1 = round(2 * precision * recall / (precision + recall), 4) \
-        if (precision + recall) > 0 else 0.0
+    # Fallback: embed on-the-fly if not in cache (edge case for very long lists)
+    if pred_vec is None or gold_vec is None:
+        vecs = engine._embed_batch([pred_text, gold_text])
+        pred_vec, gold_vec = vecs[0], vecs[1]
+
+    # Raw cosine — no threshold gate, only clamp true negatives
+    score = round(max(0.0, float(np.dot(pred_vec, gold_vec))), 4)
 
     return {
-        "precision":          precision,
-        "recall":             recall,
-        "f1":                 f1,
-        "precision_per_item": precision_per_item,
-        "recall_per_item":    recall_per_item,
+        "score":     score,
+        "pred_text": pred_text,
+        "gold_text": gold_text,
     }
 
 
@@ -321,6 +410,11 @@ def collect_all_strings(pred_list: list, gold_list: list) -> list[str]:
     """
     Walk every extraction in pred and gold, collect every string value
     that will be embedded during evaluation.
+
+    For flat list fields (conservative_method, lifestyle_habit_modifications,
+    prevention, complementary_therapies), the full concatenated set-level
+    string is collected — NOT individual items — since set_level_cosine()
+    embeds the joined string as a single unit.
 
     This single pass ensures build_cache() gets ALL strings upfront so
     the model runs exactly once over the dataset.
@@ -341,7 +435,6 @@ def collect_all_strings(pred_list: list, gold_list: list) -> list[str]:
 
         for img in (inv.get("imaging") or []):
             _collect_item(img)
-            # synthetic key used in matching
             key = f"{img.get('imaging_modality', '')} {img.get('site', '')}".strip().lower()
             if key:
                 strings.add(key)
@@ -357,17 +450,15 @@ def collect_all_strings(pred_list: list, gold_list: list) -> list[str]:
         for med in (tx.get("medical") or []):
             _collect_item(med)
 
-        # ── treatment: conservative ───────────────────────────────────────
-        for item in (cons.get("conservative_method") or []):
-            strings.add(str(item).strip().lower())
-        for item in (cons.get("lifestyle_habit_modifications") or []):
-            strings.add(str(item).strip().lower())
+        # ── treatment: conservative — SET-LEVEL strings ───────────────────
+        # Collect the full joined string, not individual items
+        _collect_flat_list_as_set(cons.get("conservative_method"))
+        _collect_flat_list_as_set(cons.get("lifestyle_habit_modifications"))
 
-        # ── treatment: other list fields ──────────────────────────────────
-        for item in (tx.get("prevention") or []):
-            strings.add(str(item).strip().lower())
-        for item in (tx.get("complementary_therapies") or []):
-            strings.add(str(item).strip().lower())
+        # ── treatment: other flat list fields — SET-LEVEL strings ─────────
+        _collect_flat_list_as_set(tx.get("prevention"))
+        _collect_flat_list_as_set(tx.get("complementary_therapies"))
+
         for eq in (tx.get("external_equipment") or []):
             _collect_item(eq)
 
@@ -385,9 +476,25 @@ def collect_all_strings(pred_list: list, gold_list: list) -> list[str]:
             if val:
                 strings.add(str(val).strip().lower())
 
+    def _collect_flat_list_as_set(items) -> None:
+        """
+        Collect the full ' | '-joined string for a flat list field.
+        This matches exactly what set_level_cosine() will embed at eval time.
+        """
+        if not items:
+            return
+        cleaned = [str(x).strip().lower() for x in items if str(x).strip()]
+        if cleaned:
+            joined = " | ".join(cleaned)
+            strings.add(joined)
+
     def _collect_item(item: dict) -> None:
         """Collect all string leaf values from a dict item."""
         if not item:
+            return
+        if isinstance(item, str):
+            if item.strip():
+                strings.add(item.strip().lower())
             return
         for val in item.values():
             if isinstance(val, str) and val.strip():
@@ -418,14 +525,24 @@ def avg(values) -> float:
 def score_subfields(pred_item: dict | None,
                     gold_item: dict,
                     engine: EmbeddingEngine,
-                    skip_keys: set = None,
-                    threshold: float = 0.65) -> dict:
+                    skip_keys: set = None) -> dict:
     """
-    Score each sub-field of a matched item pair using embedding cosine similarity.
+    Score each sub-field of a matched item pair using raw cosine similarity.
+
+    No threshold is applied — sub-fields include long descriptive sentences
+    (aim_of_referral, aim_of_follow_up, dosage instructions, etc.) where
+    partial overlap should produce a proportional score, not 0.0.
+
     pred_item = None when the gold item was unmatched (model missed it).
     """
     skip_keys = skip_keys or set()
     scores = {}
+
+    # Normalize bare strings to dicts
+    if isinstance(pred_item, str):
+        pred_item = {"name": pred_item}
+    if isinstance(gold_item, str):
+        gold_item = {"name": gold_item}
 
     for key, gold_val in gold_item.items():
         if key in skip_keys:
@@ -444,13 +561,13 @@ def score_subfields(pred_item: dict | None,
             gold_str = str(gold_val).strip() if gold_val is not None else None
             pred_str = str(pred_val).strip() if pred_val is not None else None
 
-        scores[key] = engine.similarity(pred_str, gold_str, threshold=threshold)
+        scores[key] = engine.similarity_raw(pred_str, gold_str)
 
     return scores
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — Structured item list matcher  (greedy cosine instead of chrF)
+# SECTION 5 — Structured item list matcher  (greedy cosine)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def match_and_score_list(pred_list: list,
@@ -467,8 +584,10 @@ def match_and_score_list(pred_list: list,
     Items below threshold are treated as unrelated (score 0.0).
     """
     skip_keys = skip_keys or set()
-    pred_list = pred_list or []
-    gold_list = gold_list or []
+
+    # Normalize any bare strings to dicts
+    pred_list = [{"name": p} if isinstance(p, str) else p for p in (pred_list or [])]
+    gold_list = [{"name": g} if isinstance(g, str) else g for g in (gold_list or [])]
 
     if not gold_list and not pred_list:
         return {"per_item": [], "unmatched_gold": [], "unmatched_pred": [],
@@ -488,12 +607,12 @@ def match_and_score_list(pred_list: list,
         for i in range(len(gold_list))
     ]
 
-    # Greedy matching — same logic as original, cosine replaces chrF
+    # Greedy matching
     candidates = [
         (sim_matrix[i][j], i, j)
         for i in range(len(gold_list))
         for j in range(len(pred_list))
-        if sim_matrix[i][j] > 0.0  # threshold already applied inside similarity()
+        if sim_matrix[i][j] > 0.0
     ]
     candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -515,7 +634,6 @@ def match_and_score_list(pred_list: list,
         sub_scores = score_subfields(
             pred_item, gold_item, engine,
             skip_keys={name_key} | skip_keys,
-            threshold=threshold,
         )
         item_avg = avg(sub_scores.values())
         all_item_avgs.append(item_avg)
@@ -601,21 +719,31 @@ def score_medical(pred_tx: dict, gold_tx: dict,
 def score_conservative(pred_tx: dict, gold_tx: dict,
                         engine: EmbeddingEngine,
                         threshold: float) -> dict:
+    """
+    Score the conservative treatment sub-fields using set-level cosine similarity.
+
+    Both conservative_method and lifestyle_habit_modifications are flat string
+    lists. Each list is concatenated into a single ' | '-joined string and
+    embedded as one vector. The score is the cosine similarity between the
+    pred and gold set-level vectors.
+
+    This is order-invariant in practice and handles split/merge items naturally.
+    """
     pred_c = pred_tx.get("conservative") or {}
     gold_c = gold_tx.get("conservative") or {}
 
-    method_result = embedding_coverage_f1(
+    method_result    = set_level_cosine(
         pred_c.get("conservative_method"),
         gold_c.get("conservative_method"),
-        engine=engine, threshold=threshold,
+        engine=engine,
     )
-    lifestyle_result = embedding_coverage_f1(
+    lifestyle_result = set_level_cosine(
         pred_c.get("lifestyle_habit_modifications"),
         gold_c.get("lifestyle_habit_modifications"),
-        engine=engine, threshold=threshold,
+        engine=engine,
     )
 
-    field_avg = avg([method_result["f1"], lifestyle_result["f1"]])
+    field_avg = avg([method_result["score"], lifestyle_result["score"]])
 
     return {
         "conservative_method":           method_result,
@@ -627,8 +755,8 @@ def score_conservative(pred_tx: dict, gold_tx: dict,
 def score_follow_up(pred_fu: list, gold_fu: list,
                     engine: EmbeddingEngine, threshold: float) -> dict:
     """
-    Positional matching preserved from original — index i in pred matches index i
-    in gold. Embedding similarity replaces chrF for sub-field scoring.
+    Positional matching — index i in pred matches index i in gold.
+    Embedding similarity scores sub-fields of each matched pair.
     """
     pred_fu = pred_fu or []
     gold_fu = gold_fu or []
@@ -643,7 +771,7 @@ def score_follow_up(pred_fu: list, gold_fu: list,
     for i in range(max_len):
         p = pred_fu[i] if i < len(pred_fu) else {}
         g = gold_fu[i] if i < len(gold_fu) else {}
-        sub = score_subfields(p, g, engine, threshold=threshold)
+        sub = score_subfields(p, g, engine)
         item_avg = avg(sub.values())
         all_avgs.append(item_avg)
         per_item.append({"subfield_scores": sub, "item_avg": item_avg})
@@ -661,23 +789,19 @@ def score_referral(pred_ref: list, gold_ref: list,
 
 
 def score_patient_education(pred_val, gold_val,
-                             engine: EmbeddingEngine,
-                             threshold: float) -> dict:
-    score = engine.similarity(
+                             engine: EmbeddingEngine) -> dict:
+    score = engine.similarity_raw(
         str(pred_val).strip() if pred_val else None,
         str(gold_val).strip() if gold_val else None,
-        threshold=threshold,
     )
     return {"field_avg": score}
 
 
 def score_when_to_seek(pred_val, gold_val,
-                       engine: EmbeddingEngine,
-                       threshold: float) -> dict:
-    score = engine.similarity(
+                       engine: EmbeddingEngine) -> dict:
+    score = engine.similarity_raw(
         str(pred_val).strip() if pred_val else None,
         str(gold_val).strip() if gold_val else None,
-        threshold=threshold,
     )
     return {"field_avg": score}
 
@@ -689,8 +813,6 @@ def score_when_to_seek(pred_val, gold_val,
 def _extract_field_text(field_name: str, extraction: dict) -> str:
     """
     Extract all text from a named field into a single lowercased string.
-    Identical mapping to original script — just returns a flat string
-    that we then embed as a whole for confusion scoring.
     """
     inv  = extraction.get("investigations", {}) or {}
     tx   = extraction.get("treatment", {}) or {}
@@ -771,10 +893,7 @@ def _confusion_score(gold_field_a: str, pred_field_b: str,
                      confusion_threshold: float) -> float:
     """
     Measure semantic similarity between gold's field_A and pred's field_B.
-
     A high score → the model placed field_A's content into field_B instead.
-    Uses full-field embedding similarity (embed the whole concatenated text).
-    Returns 0.0 if either field is empty (nothing to confuse).
     """
     gold_a = _extract_field_text(gold_field_a, gold_extraction)
     pred_b = _extract_field_text(pred_field_b, pred_extraction)
@@ -782,13 +901,10 @@ def _confusion_score(gold_field_a: str, pred_field_b: str,
     if not gold_a or not pred_b:
         return 0.0
 
-    # For confusion we use raw cosine (no threshold gate) so we get a
-    # continuous signal even for borderline cases
     gold_vec = engine.get_embedding(gold_a)
     pred_vec = engine.get_embedding(pred_b)
 
     if gold_vec is None or pred_vec is None:
-        # Strings might be too long or not in cache; embed on-the-fly
         vecs = engine._embed_batch([gold_a, pred_b])
         gold_vec, pred_vec = vecs[0], vecs[1]
 
@@ -796,7 +912,7 @@ def _confusion_score(gold_field_a: str, pred_field_b: str,
     return round(max(0.0, cosine), 4)
 
 
-# All confusion pairs — identical to original
+# All confusion pairs
 CONFUSION_PAIRS = [
     ("medical_routes",          "medical_dosage_forms",         "medical: route ↔ dosage_form"),
     ("imaging_modality",        "imaging_site",                 "imaging: modality ↔ site"),
@@ -922,11 +1038,11 @@ def score_case(pred_extraction: dict, gold_extraction: dict,
         "patient_education": score_patient_education(
                           pred_extraction.get("patient_education"),
                           gold_extraction.get("patient_education"),
-                          engine, threshold),
+                          engine),
         "when_to_seek_medical_care": score_when_to_seek(
                           pred_extraction.get("when_to_seek_medical_care"),
                           gold_extraction.get("when_to_seek_medical_care"),
-                          engine, threshold),
+                          engine),
     }
 
     field_scores = {name: result["field_avg"] for name, result in fields.items()}
@@ -1007,10 +1123,10 @@ def evaluate_dataset(pred_list: list, gold_list: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — Reporting  (identical structure to original)
+# SECTION 9 — Reporting
 # ══════════════════════════════════════════════════════════════════════════════
 
-_COVERAGE_FIELDS        = {"conservative"}
+_SET_LEVEL_FIELDS       = {"conservative"}
 _CONSERVATIVE_SUBFIELDS = {"conservative_method", "lifestyle_habit_modifications"}
 
 
@@ -1029,7 +1145,7 @@ def print_report(results: dict,
     print(f"  Cases evaluated  : {len(results['per_case'])}")
     print(f"  Scoring metric   : Cosine similarity (MedGemma-4b-it embeddings)")
     print(f"  Similarity thresh: {threshold}  (below → 0.0)")
-    print(f"  List fields      : Embedding Coverage F1 (soft max-cosine matching)")
+    print(f"  List fields      : Set-level cosine (full list embedded as one vector)")
     print(f"  Structured items : Greedy cosine matching + sub-field cosine")
     if run_confusion:
         print(f"  Confusion detect : ENABLED  (threshold={confusion_threshold})")
@@ -1039,7 +1155,7 @@ def print_report(results: dict,
     print(f"\n  {'Field':<35} {'Score':>8}  Metric")
     print(f"  {'─'*35} {'─'*8}  {'─'*25}")
     for field, score in results["dataset_field_scores"].items():
-        metric = "Embedding Coverage F1" if field in _COVERAGE_FIELDS \
+        metric = "Set-level Cosine" if field in _SET_LEVEL_FIELDS \
                  else "Cosine Similarity"
         print(f"  {field:<35} {score:>8.4f}  {metric}")
     print(f"  {'─'*35} {'─'*8}")
@@ -1048,31 +1164,27 @@ def print_report(results: dict,
 
     # ── Conservative field breakdown ──────────────────────────────────────
     print("─" * W)
-    print("  CONSERVATIVE TREATMENT  (Embedding Coverage F1 detail)")
+    print("  CONSERVATIVE TREATMENT  (Set-level Cosine detail)")
     print("─" * W)
     for case in results["per_case"]:
         row_id = case["row_id"]
         cons   = case["field_details"].get("conservative", {})
         print(f"\n  Case row_id={row_id}")
         for sub in _CONSERVATIVE_SUBFIELDS:
-            sub_result = cons.get(sub, {})
-            p  = sub_result.get("precision", "—")
-            r  = sub_result.get("recall",    "—")
-            f1 = sub_result.get("f1",        "—")
-            p_items = sub_result.get("precision_per_item", [])
-            r_items = sub_result.get("recall_per_item",    [])
-            label = sub.replace("_", " ")
+            sub_result  = cons.get(sub, {})
+            score       = sub_result.get("score", "—")
+            pred_text   = sub_result.get("pred_text", "")
+            gold_text   = sub_result.get("gold_text", "")
+            label       = sub.replace("_", " ")
             print(f"    {label}")
-            print(f"      P={p:.4f}  R={r:.4f}  F1={f1:.4f}" if isinstance(f1, float)
-                  else f"      {p} / {r} / {f1}")
-            if p_items:
-                print(f"      Precision per pred item:")
-                for item, score in p_items:
-                    print(f"        [{score:.2f}]  \"{item}\"")
-            if r_items:
-                print(f"      Recall per gold item:")
-                for item, score in r_items:
-                    print(f"        [{score:.2f}]  \"{item}\"")
+            if isinstance(score, float):
+                print(f"      Score = {score:.4f}")
+            else:
+                print(f"      Score = {score}")
+            if pred_text:
+                print(f"      Pred  : \"{pred_text}\"")
+            if gold_text:
+                print(f"      Gold  : \"{gold_text}\"")
 
     # ── Per-case summary table ─────────────────────────────────────────────
     print()
@@ -1243,18 +1355,15 @@ Examples:
 if __name__ == "__main__":
     main()
 
-
-
 """
 python semantic_eval_script.py \
     --pred extracted_plan_google_gemini-2.0-flash-001_pydantic_normalized.json \
     --gold extractions_annotator_2_normalized.json \
-    --output annotator_2_gemini_2_flash_semantic_eval_results_medgemma.json \
-    --embedding-model google/medgemma-4b-it \
+    --output annotator_2_gemini_2_flash_semantic_eval_results_bio_clinical_bert.json \
+    --embedding-model thomas-sounack/BioClinical-ModernBERT-base \
     --batch-size 32 \
     --device cuda \
-    --threshold 0.65 \
+    --threshold 0.6 \
     --confusion \
-    --confusion-threshold 0.5 \
-    --cache-embeddings dataset_embeddings.pt
+    --confusion-threshold 0.7
 """
